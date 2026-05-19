@@ -80,6 +80,7 @@ from custom_tools.telegram_gateway.voice_tts import (
     is_voice_request,
     extract_voice_text,
 )
+from custom_tools.telegram_gateway.nl_router import detect_intent
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -386,6 +387,312 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════
+# NATURAL LANGUAGE INTENT HANDLER
+# ═══════════════════════════════════════════════
+
+async def _handle_nl_intent(update: Update, uid: int, intent: dict) -> bool:
+    """
+    Handle detected NL intent. Returns True if handled, False to fall through.
+    """
+    intent_type = intent["intent"]
+
+    if intent_type == "WALLET_CREATE":
+        label = intent.get("label")
+        if not label:
+            await update.message.reply_text("mau kasih nama apa walletnya sayang?\ncontoh: buat wallet burner5")
+            return True
+        try:
+            from custom_tools.wallet_manager import create_burner_wallet
+            result = create_burner_wallet(label)
+            await update.message.reply_text(
+                f"✅ done sayang! wallet baru udah jadi 😈\n\n"
+                f"<b>Label:</b> {result['label']}\n"
+                f"<b>Address:</b> <code>{result['address']}</code>\n\n"
+                f"🔐 Private key encrypted. Aman.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ gagal buat wallet beb: {e}")
+        return True
+
+    elif intent_type == "WALLET_LIST":
+        try:
+            from custom_tools.wallet_manager import list_wallets
+            wallets = list_wallets()
+            if not wallets:
+                await update.message.reply_text("belum ada wallet sayang. Bilang aja 'buat wallet baru' 💕")
+                return True
+            lines = ["👛 <b>Wallet kamu sayang:</b>\n"]
+            for w in wallets:
+                lines.append(f"• <b>{w['label']}</b>: <code>{w['address']}</code>")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+        return True
+
+    elif intent_type == "WALLET_BALANCE":
+        label = intent.get("label")
+        if not label:
+            await update.message.reply_text("wallet yang mana sayang? kasih labelnya.\ncontoh: cek balance burner1")
+            return True
+        try:
+            from custom_tools.wallet_manager import check_wallet_balance
+            result = check_wallet_balance(label, "ethereum")
+            await update.message.reply_text(
+                f"👛 <b>{result['label']}</b>\n"
+                f"<b>Balance:</b> {result['balance_eth']} ETH\n"
+                f"<b>Address:</b> <code>{result['address']}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+        return True
+
+    elif intent_type == "WALLET_DELETE":
+        label = intent.get("label")
+        if not label:
+            await update.message.reply_text("wallet mana yang mau dihapus sayang?")
+            return True
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"✅ Hapus {label}", callback_data=f"delwallet_{label}"),
+                InlineKeyboardButton("❌ Batal", callback_data="delwallet_cancel"),
+            ]
+        ])
+        await update.message.reply_text(
+            f"yakin mau hapus wallet <b>{label}</b> sayang? 🥺",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return True
+
+    elif intent_type == "MINT_ANALYZE":
+        address = intent.get("address")
+        if not address:
+            return False  # Fall through to AI
+        chain = intent.get("chain", "ethereum")
+        await update.message.chat.send_action("typing")
+        await update.message.reply_text("siapp sayang 😈 aku cek dulu kontraknya ya...")
+
+        # Analyze contract
+        from custom_tools.telegram_gateway.web3_skills import analyze_contract
+        result = await analyze_contract(address, chain)
+
+        # Show analysis + wallet selection
+        try:
+            from custom_tools.wallet_manager import list_wallets
+            wallets = list_wallets()
+            wallet_lines = ""
+            if wallets:
+                wallet_lines = "\n\n<b>Wallet tersedia:</b>\n"
+                for i, w in enumerate(wallets, 1):
+                    wallet_lines += f"  {i}. {w['label']} - <code>{w['address'][:10]}...</code>\n"
+                wallet_lines += "\nbalas nama wallet atau 'all' ya sayang 💕"
+        except Exception:
+            wallet_lines = "\n\nbelum ada wallet. Bilang 'buat wallet baru' dulu ya."
+
+        full_msg = f"aku cek dulu ya sayang 😈\n\n{result}{wallet_lines}"
+        for i in range(0, len(full_msg), 4096):
+            await update.message.reply_text(
+                full_msg[i:i+4096],
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        return True
+
+    elif intent_type == "MINT_ALL":
+        address = intent.get("address")
+        if not address:
+            await update.message.reply_text("kasih contract address-nya dong sayang~\ncontoh: mint semua wallet 0x...")
+            return True
+        try:
+            from custom_tools.wallet_manager import list_wallets
+            wallets = list_wallets()
+            if not wallets:
+                await update.message.reply_text("belum ada wallet sayang. Buat dulu ya~")
+                return True
+            labels = [w["label"] for w in wallets]
+            await update.message.reply_text(
+                f"mau queue mint ke {len(labels)} wallet:\n"
+                + "\n".join(f"  • {l}" for l in labels)
+                + f"\n\nContract: <code>{address}</code>\n\n"
+                f"ketik /mintall {address} untuk queue semua.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+        return True
+
+    return False
+
+
+# ═══════════════════════════════════════════════
+# ADDITIONAL COMMANDS: /mint, /mintall, /analyzemint, /deletewallet
+# ═══════════════════════════════════════════════
+
+async def cmd_mint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /mint <contract> --wallet <label> [--function fn] [--quantity n] [--price-wei n]"""
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        return await update.message.reply_text(unauthorized_msg())
+    if not context.args:
+        return await update.message.reply_text(
+            "Usage: /mint <contract> --wallet <label>\n"
+            "Options: --function mint --quantity 1 --price-wei 0"
+        )
+
+    # Parse args
+    args = context.args
+    contract_addr = args[0]
+    wallet_label = None
+    mint_function = None
+    quantity = 1
+    price_wei = None
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--wallet" and i + 1 < len(args):
+            wallet_label = args[i + 1]; i += 2
+        elif args[i] == "--function" and i + 1 < len(args):
+            mint_function = args[i + 1]; i += 2
+        elif args[i] == "--quantity" and i + 1 < len(args):
+            quantity = int(args[i + 1]); i += 2
+        elif args[i] == "--price-wei" and i + 1 < len(args):
+            price_wei = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    if not wallet_label:
+        return await update.message.reply_text("kasih wallet label dong sayang~\n/mint 0x... --wallet burner1")
+
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text("siapp sayang 😈 lagi bikin mint plan...")
+
+    try:
+        from custom_tools.mint_planner import build_mint_transaction
+        from custom_tools.approval_queue import add_to_queue
+
+        preview = build_mint_transaction(
+            contract_addr, wallet_label,
+            quantity=quantity,
+            mint_function=mint_function,
+            mint_price_wei=price_wei,
+        )
+        approval_id = add_to_queue(preview)
+
+        await update.message.reply_text(
+            f"done sayang 😈\nmint plan sudah aku queue.\n\n"
+            f"<b>Approval ID:</b> #{approval_id}\n"
+            f"<b>Status:</b> PENDING\n\n"
+            f"Cek: /status {approval_id}\n"
+            f"Approve: /approve {approval_id}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ gagal beb: {e}")
+
+
+async def cmd_mintall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /mintall <contract> [--function fn] [--quantity n] [--price-wei n]"""
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        return await update.message.reply_text(unauthorized_msg())
+    if not context.args:
+        return await update.message.reply_text("Usage: /mintall <contract> [--function mint] [--quantity 1]")
+
+    args = context.args
+    contract_addr = args[0]
+    mint_function = None
+    quantity = 1
+    price_wei = None
+
+    i = 1
+    while i < len(args):
+        if args[i] == "--function" and i + 1 < len(args):
+            mint_function = args[i + 1]; i += 2
+        elif args[i] == "--quantity" and i + 1 < len(args):
+            quantity = int(args[i + 1]); i += 2
+        elif args[i] == "--price-wei" and i + 1 < len(args):
+            price_wei = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    await update.message.chat.send_action("typing")
+
+    try:
+        from custom_tools.wallet_manager import list_wallets
+        from custom_tools.mint_planner import build_mint_transaction
+        from custom_tools.approval_queue import add_to_queue
+
+        wallets = list_wallets()
+        if not wallets:
+            return await update.message.reply_text("belum ada wallet sayang~")
+
+        await update.message.reply_text(f"queuing mint untuk {len(wallets)} wallet... 😈")
+
+        ids = []
+        for w in wallets:
+            try:
+                preview = build_mint_transaction(
+                    contract_addr, w["label"],
+                    quantity=quantity,
+                    mint_function=mint_function,
+                    mint_price_wei=price_wei,
+                )
+                aid = add_to_queue(preview)
+                ids.append(str(aid))
+            except Exception as e:
+                ids.append(f"❌{w['label']}")
+
+        await update.message.reply_text(
+            f"done beb 😈\naku sudah queue {len(ids)} mint plans.\n\n"
+            f"<b>IDs:</b> #{', #'.join(ids)}\n\n"
+            f"Approve semua satu-satu ya sayang~",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_analyzemint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /analyzemint <contract> [chain]"""
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        return await update.message.reply_text(unauthorized_msg())
+    if not context.args:
+        return await update.message.reply_text("Usage: /analyzemint <0x...> [chain]")
+
+    addr = context.args[0]
+    chain = context.args[1] if len(context.args) > 1 else "ethereum"
+
+    await update.message.chat.send_action("typing")
+    result = await analyze_contract(addr, chain)
+    await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def cmd_deletewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /deletewallet <label>"""
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        return await update.message.reply_text(unauthorized_msg())
+    if not context.args:
+        return await update.message.reply_text("Usage: /deletewallet <label>")
+
+    label = context.args[0]
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"✅ Hapus {label}", callback_data=f"delwallet_{label}"),
+            InlineKeyboardButton("❌ Batal", callback_data="delwallet_cancel"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"yakin mau hapus wallet <b>{label}</b> sayang? 🥺\nini ga bisa di-undo loh.",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# ═══════════════════════════════════════════════
 # AI CHAT HANDLER (catches all non-command text)
 # ═══════════════════════════════════════════════
 
@@ -397,6 +704,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text:
         return
+
+    # --- Natural Language Router (wallet + mint intents) ---
+    intent = detect_intent(text)
+    if intent:
+        handled = await _handle_nl_intent(update, uid, intent)
+        if handled:
+            return
 
     # --- Auto-detect: Shower selfie request (check before general selfie) ---
     if is_shower_selfie_request(text):
@@ -560,24 +874,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await analyze_risk(param, uid, "ethereum")
             await query.edit_message_text(result[:4096], parse_mode="HTML", disable_web_page_preview=True)
 
-        # Web3 skill actions (from auto-detection)
-        elif action == "contract":
-            await query.answer("Analyzing contract...")
-            result = await analyze_contract(param, "ethereum")
-            await query.edit_message_text(result, parse_mode="HTML", disable_web_page_preview=True)
-
-        elif action == "wallet":
-            await query.answer("Checking wallet...")
-            result = await analyze_wallet(param, "ethereum")
-            await query.edit_message_text(result, parse_mode="HTML")
-
-        elif action == "risk":
-            await query.answer("Analyzing risk...")
-            result = await analyze_risk(param, user_id, "ethereum")
-            if len(result) <= 4096:
-                await query.edit_message_text(result, parse_mode="HTML", disable_web_page_preview=True)
+        elif action == "delwallet":
+            if param == "cancel":
+                await query.answer("Dibatalin~")
+                await query.edit_message_text("oke sayang, ga jadi dihapus 💕")
             else:
-                await query.edit_message_text(result[:4096], parse_mode="HTML", disable_web_page_preview=True)
+                try:
+                    from custom_tools.wallet_manager import WALLETS_DIR
+                    wallet_file = WALLETS_DIR / f"{param}.json"
+                    if wallet_file.exists():
+                        wallet_file.unlink()
+                        await query.answer(f"Wallet {param} deleted")
+                        await query.edit_message_text(f"✅ Wallet <b>{param}</b> udah dihapus sayang.", parse_mode="HTML")
+                    else:
+                        await query.answer("Wallet not found")
+                        await query.edit_message_text(f"❌ Wallet {param} ga ketemu beb.")
+                except Exception as e:
+                    await query.answer(f"Error: {e}", show_alert=True)
 
         else:
             await query.answer("Unknown")
@@ -625,6 +938,10 @@ def main():
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("createwallet", cmd_createwallet))
     app.add_handler(CommandHandler("walletbalance", cmd_walletbalance))
+    app.add_handler(CommandHandler("deletewallet", cmd_deletewallet))
+    app.add_handler(CommandHandler("mint", cmd_mint))
+    app.add_handler(CommandHandler("mintall", cmd_mintall))
+    app.add_handler(CommandHandler("analyzemint", cmd_analyzemint))
     app.add_handler(CommandHandler("floor", cmd_floor))
     app.add_handler(CommandHandler("risk", cmd_risk))
     app.add_handler(CommandHandler("generate", cmd_generate))
