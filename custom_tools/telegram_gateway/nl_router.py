@@ -69,6 +69,19 @@ MINT_ALL_PATTERNS = [
     r"mint\s*(?:pakai|pake)\s*semua\s*wallet\s*(0x[a-fA-F0-9]{40})?",
 ]
 
+DISTRIBUTE_PATTERNS = [
+    r"bagi\s*rata\s*(?:eth)?",
+    r"spread\s*eth",
+    r"fund\s*(?:semua\s*)?wallet",
+    r"kirim\s*eth\s*ke\s*semua\s*wallet",
+    r"transfer\s*(?:\d+\.?\d*\s*)?eth\s*ke\s*semua",
+    r"distribute\s*eth",
+    r"isi\s*(?:semua\s*)?wallet",
+    r"split\s*eth",
+    r"spreadeth",
+    r"fundwallets",
+]
+
 # Wallet label extraction from create commands
 WALLET_LABEL_PATTERN = r"(?:label|nama)\s*(\w+)|wallet\s+(\w+)$"
 
@@ -123,6 +136,19 @@ def detect_intent(text: str) -> dict | None:
             return {
                 "intent": "WALLET_BALANCE",
                 "label": label,
+                "raw_text": text,
+            }
+
+    # --- DISTRIBUTE ETH ---
+    for pattern in DISTRIBUTE_PATTERNS:
+        if re.search(pattern, text_lower):
+            from custom_tools.telegram_gateway.eth_distributor import parse_distribute_params
+            params = parse_distribute_params(text)
+            return {
+                "intent": "DISTRIBUTE",
+                "from_label": params.get("from_label"),
+                "amount_eth": params.get("amount_eth"),
+                "per_wallet": params.get("per_wallet", False),
                 "raw_text": text,
             }
 

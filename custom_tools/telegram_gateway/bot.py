@@ -81,6 +81,11 @@ from custom_tools.telegram_gateway.voice_tts import (
     extract_voice_text,
 )
 from custom_tools.telegram_gateway.nl_router import detect_intent
+from custom_tools.telegram_gateway.eth_distributor import (
+    build_distribution_plan,
+    queue_distribution,
+    format_distribution_preview,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -523,6 +528,39 @@ async def _handle_nl_intent(update: Update, uid: int, intent: dict) -> bool:
             await update.message.reply_text(f"❌ Error: {e}")
         return True
 
+    elif intent_type == "DISTRIBUTE":
+        from_label = intent.get("from_label")
+        amount_eth = intent.get("amount_eth")
+        per_wallet = intent.get("per_wallet", False)
+
+        if not from_label:
+            await update.message.reply_text(
+                "dari wallet mana sayang? kasih label source wallet-nya.\n"
+                "contoh: bagi rata 0.01 eth dari test1"
+            )
+            return True
+
+        await update.message.chat.send_action("typing")
+        await update.message.reply_text("siapp sayang 😈\naku hitung dulu pembagian ETH-nya ya...")
+
+        try:
+            if per_wallet and amount_eth:
+                plan = build_distribution_plan(from_label, per_wallet_eth=amount_eth)
+            elif amount_eth:
+                plan = build_distribution_plan(from_label, total_amount_eth=amount_eth)
+            else:
+                # Distribute all available
+                plan = build_distribution_plan(from_label)
+
+            approval_id = queue_distribution(plan)
+            preview = format_distribution_preview(plan, approval_id=approval_id)
+
+            for i in range(0, len(preview), 4096):
+                await update.message.reply_text(preview[i:i+4096], parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ gagal beb: {e}")
+        return True
+
     return False
 
 
@@ -690,6 +728,54 @@ async def cmd_deletewallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=kb,
     )
+
+
+async def cmd_distribute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /distribute <from_label> <amount_eth> or /spreadeth or /fundwallets"""
+    uid = update.effective_user.id
+    if not is_authorized(uid):
+        return await update.message.reply_text(unauthorized_msg())
+    if not context.args or len(context.args) < 2:
+        return await update.message.reply_text(
+            "Usage: /distribute <from_wallet> <total_eth>\n"
+            "Contoh: /distribute test1 0.01\n\n"
+            "Options:\n"
+            "  /distribute test1 0.01 --reserve 0.001\n"
+            "  /distribute test1 0.002 --per-wallet"
+        )
+
+    from_label = context.args[0]
+    amount = float(context.args[1])
+
+    # Parse optional flags
+    reserve = 0.0
+    per_wallet = False
+    i = 2
+    while i < len(context.args):
+        if context.args[i] == "--reserve" and i + 1 < len(context.args):
+            reserve = float(context.args[i + 1]); i += 2
+        elif context.args[i] == "--per-wallet":
+            per_wallet = True; i += 1
+        else:
+            i += 1
+
+    await update.message.chat.send_action("typing")
+    await update.message.reply_text("siapp sayang 😈\naku hitung dulu pembagian ETH-nya ya...")
+
+    try:
+        if per_wallet:
+            plan = build_distribution_plan(from_label, per_wallet_eth=amount, reserve_eth=reserve)
+        else:
+            plan = build_distribution_plan(from_label, total_amount_eth=amount, reserve_eth=reserve)
+
+        approval_id = queue_distribution(plan)
+        preview = format_distribution_preview(plan, approval_id=approval_id)
+
+        for i in range(0, len(preview), 4096):
+            await update.message.reply_text(preview[i:i+4096], parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ gagal beb: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -939,6 +1025,9 @@ def main():
     app.add_handler(CommandHandler("createwallet", cmd_createwallet))
     app.add_handler(CommandHandler("walletbalance", cmd_walletbalance))
     app.add_handler(CommandHandler("deletewallet", cmd_deletewallet))
+    app.add_handler(CommandHandler("distribute", cmd_distribute))
+    app.add_handler(CommandHandler("spreadeth", cmd_distribute))
+    app.add_handler(CommandHandler("fundwallets", cmd_distribute))
     app.add_handler(CommandHandler("mint", cmd_mint))
     app.add_handler(CommandHandler("mintall", cmd_mintall))
     app.add_handler(CommandHandler("analyzemint", cmd_analyzemint))
