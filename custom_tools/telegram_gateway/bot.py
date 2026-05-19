@@ -384,29 +384,79 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_text:
         return
 
-    # === Auto-detection ===
-
-    # Detect 0x address -> offer contract/wallet analysis
+    # === Auto-detection: Ethereum address ===
     detected_addr = detect_address(message_text)
-    if detected_addr and message_text.strip() == detected_addr:
-        # Pure address sent, offer options
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔍 Contract", callback_data=f"contract_{detected_addr}"),
-                InlineKeyboardButton("👛 Wallet", callback_data=f"wallet_{detected_addr}"),
-            ],
-            [
-                InlineKeyboardButton("⚠️ Risk", callback_data=f"risk_{detected_addr}"),
-            ],
-        ])
-        await update.message.reply_text(
-            f"aku detect address nih sayang~\n<code>{detected_addr}</code>\n\nmau aku cek apa?",
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-        return
 
-    # Detect OpenSea link -> auto floor check
+    if detected_addr:
+        # Case 1: Pure address only (no other text)
+        if message_text.strip() == detected_addr:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🔍 Contract", callback_data=f"contract_{detected_addr}"),
+                    InlineKeyboardButton("👛 Wallet", callback_data=f"wallet_{detected_addr}"),
+                ],
+                [
+                    InlineKeyboardButton("⚠️ Risk", callback_data=f"risk_{detected_addr}"),
+                ],
+            ])
+            await update.message.reply_text(
+                f"aku detect address nih sayang~\n<code>{detected_addr}</code>\n\nmau aku cek apa?",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return
+
+        # Case 2: Address inside a sentence -> auto-analyze with Web3 tools
+        await update.message.chat.send_action("typing")
+
+        # Check if it's a contract or wallet using real on-chain data
+        chain = detect_chain_from_text(message_text)
+        try:
+            from custom_tools.nft_contract_check import check_nft_contract
+            contract_info = check_nft_contract(detected_addr, chain)
+
+            if contract_info.get("is_contract") and (
+                contract_info.get("is_erc721") or contract_info.get("is_erc1155")
+            ):
+                # It's an NFT contract -> show contract analysis
+                result = await analyze_contract(detected_addr, chain)
+                await update.message.reply_text(
+                    f"aku cek langsung ya sayang~ 🔍\n\n{result}",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
+            elif contract_info.get("is_contract"):
+                # Contract but not NFT -> still show contract info
+                result = await analyze_contract(detected_addr, chain)
+                await update.message.reply_text(
+                    f"ini contract tapi bukan NFT standard beb 🤔\n\n{result}",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                return
+            else:
+                # Not a contract -> it's a wallet (EOA)
+                result = await analyze_wallet(detected_addr, chain)
+                await update.message.reply_text(
+                    f"ini wallet address ya sayang~ 👛\n\n{result}",
+                    parse_mode="HTML",
+                )
+                return
+        except Exception as e:
+            # If RPC fails, fall through to AI chat with context
+            logger.warning(f"Web3 tool call failed for {detected_addr}: {e}")
+            # Let AI handle but inject the failure context
+            extra = f"[User mentioned address {detected_addr} but RPC call failed: {str(e)[:50]}. Tell user to check RPC config.]"
+            response = await get_ai_response_with_queue_context(user_id, message_text + f"\n{extra}")
+            if len(response) <= 4096:
+                await update.message.reply_text(response)
+            else:
+                for i in range(0, len(response), 4096):
+                    await update.message.reply_text(response[i:i + 4096])
+            return
+
+    # === Auto-detection: OpenSea link ===
     opensea_slug = detect_opensea_slug(message_text)
     if opensea_slug and "opensea.io" in message_text:
         await update.message.chat.send_action("typing")
@@ -414,7 +464,7 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result, parse_mode="HTML", disable_web_page_preview=True)
         return
 
-    # === Normal AI chat ===
+    # === Normal AI chat (no address detected) ===
     await update.message.chat.send_action("typing")
     response = await get_ai_response_with_queue_context(user_id, message_text)
 
