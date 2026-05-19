@@ -1,12 +1,17 @@
 """
-telegram_gateway/bot.py - Telegram Approval Bot (Full Implementation)
-======================================================================
+telegram_gateway/bot.py - Telegram AI Approval Bot (Evelyn)
+=============================================================
 Commands:
-  /start       - Welcome message
-  /pending     - List pending approval entries
+  /start        - Welcome message
+  /pending      - List pending approval entries
   /approve <id> - Approve a pending entry
   /reject <id>  - Reject a pending entry
   /status <id>  - Check entry status
+  /clear        - Clear AI conversation history
+
+AI Chat:
+  Any normal text message gets an AI response from Evelyn
+  (casual Indonesian crypto degen assistant via OpenRouter)
 
 Inline buttons:
   Approve / Reject / Dry Run preview
@@ -14,8 +19,8 @@ Inline buttons:
 SAFETY:
 - Only TELEGRAM_ALLOWED_USERS can approve/reject
 - Private keys are NEVER shown or logged
-- Bot does NOT auto-execute transactions (approval only)
-- DRY_RUN status shown in previews
+- Bot does NOT auto-execute transactions
+- AI chat CANNOT trigger blockchain transactions
 
 Usage:
     python -m custom_tools.telegram_gateway.bot
@@ -23,7 +28,6 @@ Usage:
 
 import os
 import sys
-import json
 import logging
 from pathlib import Path
 
@@ -32,6 +36,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -43,6 +49,10 @@ from custom_tools.approval_queue import (
     approve,
     reject,
     get_entry,
+)
+from custom_tools.telegram_gateway.ai_chat import (
+    get_ai_response_with_queue_context,
+    clear_conversation,
 )
 
 # Configure logging
@@ -68,7 +78,7 @@ def is_authorized(user_id: int) -> bool:
 
 
 def unauthorized_message() -> str:
-    return "Unauthorized. Your user ID is not in TELEGRAM_ALLOWED_USERS."
+    return "🚫 Unauthorized. Your user ID is not in TELEGRAM_ALLOWED_USERS."
 
 
 def format_entry_preview(entry: dict) -> str:
@@ -128,14 +138,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = (
-        "🤖 <b>Hermes Web3 Approval Bot</b>\n\n"
-        "Commands:\n"
+        "👋 <b>Halo! Gw Evelyn.</b>\n\n"
+        "AI assistant lo buat Web3/NFT approval workflow.\n\n"
+        "<b>Commands:</b>\n"
         "  /pending - List pending approvals\n"
         "  /approve &lt;id&gt; - Approve entry\n"
         "  /reject &lt;id&gt; - Reject entry\n"
-        "  /status &lt;id&gt; - Check entry status\n\n"
+        "  /status &lt;id&gt; - Check entry status\n"
+        "  /clear - Clear chat history\n\n"
+        "<b>AI Chat:</b>\n"
+        "Ketik apa aja — gw bisa bantu soal NFT, contracts, "
+        "mint plans, gas, atau sekedar ngobrol.\n\n"
         f"DRY_RUN: <b>{'ON' if DRY_RUN else 'OFF'}</b>\n"
-        f"Your User ID: <code>{user_id}</code>"
+        f"Your ID: <code>{user_id}</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -151,7 +166,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entries = list_queue(status="pending", limit=10)
 
     if not entries:
-        await update.message.reply_text("✅ No pending approvals.")
+        await update.message.reply_text("✅ Queue kosong, ga ada pending approvals.")
         return
 
     await update.message.reply_text(
@@ -179,7 +194,7 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         entry_id = int(context.args[0])
-        result = approve(entry_id, approved_by=f"telegram:{user_id}")
+        approve(entry_id, approved_by=f"telegram:{user_id}")
         await update.message.reply_text(
             f"✅ Entry #{entry_id} <b>APPROVED</b> by user {user_id}",
             parse_mode="HTML",
@@ -205,7 +220,7 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         entry_id = int(context.args[0])
         reason = " ".join(context.args[1:]) if len(context.args) > 1 else f"Rejected by telegram:{user_id}"
-        result = reject(entry_id, reason=reason)
+        reject(entry_id, reason=reason)
         await update.message.reply_text(
             f"❌ Entry #{entry_id} <b>REJECTED</b>\nReason: {reason}",
             parse_mode="HTML",
@@ -237,6 +252,47 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {e}")
 
 
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clear command - clear AI conversation history."""
+    user_id = update.effective_user.id
+
+    if not is_authorized(user_id):
+        await update.message.reply_text(unauthorized_message())
+        return
+
+    clear_conversation(user_id)
+    await update.message.reply_text("🧹 Chat history cleared. Fresh start!")
+
+
+# === AI Chat Handler ===
+
+async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle normal text messages with AI response."""
+    user_id = update.effective_user.id
+
+    if not is_authorized(user_id):
+        await update.message.reply_text(unauthorized_message())
+        return
+
+    message_text = update.message.text
+    if not message_text:
+        return
+
+    # Show typing indicator
+    await update.message.chat.send_action("typing")
+
+    # Get AI response
+    response = await get_ai_response_with_queue_context(user_id, message_text)
+
+    # Send response (split if too long for Telegram's 4096 char limit)
+    if len(response) <= 4096:
+        await update.message.reply_text(response)
+    else:
+        # Split into chunks
+        for i in range(0, len(response), 4096):
+            await update.message.reply_text(response[i:i + 4096])
+
+
 # === Callback Query Handler (Inline Buttons) ===
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +304,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Unauthorized", show_alert=True)
         return
 
-    data = query.data  # e.g. "approve_1", "reject_1", "preview_1"
+    data = query.data
     parts = data.split("_", 1)
 
     if len(parts) != 2:
@@ -283,7 +339,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "preview":
             entry = get_entry(entry_id)
             text = format_entry_preview(entry)
-            text += "\n\n🔍 <b>This is a preview only. No transaction sent.</b>"
+            text += "\n\n🔍 <b>Preview only. No transaction sent.</b>"
             await query.answer("Preview loaded")
             keyboard = get_approval_keyboard(entry_id)
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -297,8 +353,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"Error: {e}", show_alert=True)
 
 
+# === Main ===
+
 def main():
-    """Start the Telegram bot."""
+    """Start the Telegram bot with AI chat support."""
     if not BOT_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set in environment")
         print("Set it in .env: TELEGRAM_BOT_TOKEN=your-bot-token")
@@ -309,20 +367,30 @@ def main():
         print("Set it in .env: TELEGRAM_ALLOWED_USERS=123456789,987654321")
         sys.exit(1)
 
-    print(f"Starting Hermes Telegram Approval Bot...")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+
+    print(f"Starting Evelyn - Hermes Web3 AI Bot...")
     print(f"Allowed users: {ALLOWED_USERS}")
     print(f"DRY_RUN: {DRY_RUN}")
+    print(f"AI Chat: {'ENABLED' if openrouter_key else 'DISABLED (no OPENROUTER_API_KEY)'}")
+    print(f"Model: {os.getenv('OPENROUTER_MODEL', 'openai/gpt-4o-mini')}")
     print()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # Register command handlers (higher priority)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+
+    # Inline button handler
     app.add_handler(CallbackQueryHandler(button_callback))
+
+    # AI chat handler (catches all non-command text messages)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
 
     # Start polling
     print("Bot is running. Press Ctrl+C to stop.")
