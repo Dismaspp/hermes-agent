@@ -264,10 +264,62 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Chat history cleared. Fresh start!")
 
 
+# === Intent Detection ===
+
+def detect_intent(text: str) -> str:
+    """
+    Detect user intent from message text.
+
+    Supported intents:
+    - wallet_create: user wants to create a wallet
+    - wallet_list: user wants to list wallets
+    - wallet_delete: user wants to delete a wallet
+    - wallet_balance: user wants to check wallet balance
+    - mint_request: user wants to mint / plan a mint
+    - contract_scan: user wants to scan/analyze a contract
+    - image_request: user sends image-related request
+    - voice_request: user sends voice-related request
+    - general_chat: default fallback
+
+    Returns:
+        Intent string
+    """
+    lower = text.lower().strip()
+
+    # Wallet intents
+    if any(kw in lower for kw in ["buat wallet", "create wallet", "bikin wallet", "new wallet"]):
+        return "wallet_create"
+    if any(kw in lower for kw in ["list wallet", "daftar wallet", "wallet list", "semua wallet"]):
+        return "wallet_list"
+    if any(kw in lower for kw in ["hapus wallet", "delete wallet", "remove wallet"]):
+        return "wallet_delete"
+    if any(kw in lower for kw in ["balance", "saldo", "cek balance", "wallet balance"]):
+        return "wallet_balance"
+
+    # Mint intent
+    if any(kw in lower for kw in ["mint", "minting", "mint nft", "plan mint", "mint plan"]):
+        return "mint_request"
+
+    # Contract scan intent
+    if any(kw in lower for kw in ["scan contract", "analyze contract", "cek contract", "contract info", "scan nft"]):
+        return "contract_scan"
+
+    # Image request
+    if any(kw in lower for kw in ["gambar", "image", "foto", "picture", "generate image"]):
+        return "image_request"
+
+    # Voice request
+    if any(kw in lower for kw in ["voice", "suara", "audio", "rekam"]):
+        return "voice_request"
+
+    # Default
+    return "general_chat"
+
+
 # === AI Chat Handler ===
 
 async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle normal text messages with AI response."""
+    """Handle normal text messages with intent detection + AI response."""
     user_id = update.effective_user.id
 
     if not is_authorized(user_id):
@@ -278,17 +330,67 @@ async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message_text:
         return
 
+    # Detect intent
+    intent = detect_intent(message_text)
+
     # Show typing indicator
     await update.message.chat.send_action("typing")
 
-    # Get AI response
-    response = await get_ai_response_with_queue_context(user_id, message_text)
+    # Handle special intents with guidance (but don't auto-execute)
+    if intent == "wallet_create":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants to create wallet. "
+            "Guide them to use CLI: python -m custom_tools.wallet_manager create --label <name>. "
+            "Do NOT execute commands directly.]"
+        )
+    elif intent == "wallet_list":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants wallet list. "
+            "Guide them to use CLI: python -m custom_tools.wallet_manager list. "
+            "Do NOT execute commands directly.]"
+        )
+    elif intent == "wallet_delete":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants to delete wallet. "
+            "Warn about irreversibility. Guide CLI usage.]"
+        )
+    elif intent == "wallet_balance":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants balance check. "
+            "Guide them: python -m custom_tools.wallet_manager balance --label <name> --chain <chain>. "
+            "Do NOT execute.]"
+        )
+    elif intent == "mint_request":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants to mint. "
+            "Guide them through the approval workflow: "
+            "mint_planner -> approval_queue -> approve -> executor. "
+            "NEVER auto-execute mint from chat.]"
+        )
+    elif intent == "contract_scan":
+        response = await get_ai_response_with_queue_context(
+            user_id,
+            message_text + "\n[Intent: user wants to scan a contract. "
+            "Guide them: python -m custom_tools.contract_analyzer <address> --chain <chain>. "
+            "Do NOT execute.]"
+        )
+    elif intent == "image_request":
+        response = "🖼 Image generation belum supported di bot ini bro. Gw fokus di Web3/NFT tools aja ya."
+    elif intent == "voice_request":
+        response = "🎙 Voice messages belum supported. Ketik aja text, gw bisa bantu."
+    else:
+        # general_chat - standard AI response
+        response = await get_ai_response_with_queue_context(user_id, message_text)
 
     # Send response (split if too long for Telegram's 4096 char limit)
     if len(response) <= 4096:
         await update.message.reply_text(response)
     else:
-        # Split into chunks
         for i in range(0, len(response), 4096):
             await update.message.reply_text(response[i:i + 4096])
 
