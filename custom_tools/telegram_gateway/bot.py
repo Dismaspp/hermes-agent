@@ -72,6 +72,21 @@ from custom_tools.telegram_gateway.mint_operator import (
     format_mint_plan_result,
     format_wallet_selection_prompt,
 )
+from custom_tools.telegram_gateway.nl_router import detect_intent
+from custom_tools.telegram_gateway.image_gen import (
+    generate_image,
+    generate_evelyn_selfie,
+    generate_evelyn_shower_selfie,
+    is_image_request,
+    is_selfie_request,
+    is_shower_selfie_request,
+    extract_image_prompt,
+)
+from custom_tools.telegram_gateway.voice_tts import (
+    is_voice_request,
+    generate_voice,
+    extract_voice_text,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -127,8 +142,7 @@ def approval_kb(entry_id: int) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("👁 Preview", callback_data=f"preview_{entry_id}"),
         ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 
 # ═══════════════════════════════════════════════
@@ -1142,6 +1156,21 @@ def main():
     print()
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Global error handler - bot never crashes silently
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Global error handler - friendly reply instead of crash."""
+        logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
+        if update and hasattr(update, "effective_message") and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ Oops, ada error internal. Coba lagi ya.\n"
+                    f"Detail: {str(context.error)[:100]}"
+                )
+            except Exception:
+                pass
+
+    app.add_error_handler(error_handler)
 
     # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
