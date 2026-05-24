@@ -1,149 +1,222 @@
 """
-ai_chat.py - Evelyn AI Chat Engine (OpenRouter)
-=================================================
-- OpenRouter (OpenAI-compatible) async integration via httpx
-- Deep emotionally-attached Evelyn personality (deep_waifu default)
-- Per-user conversation memory with context limit
-- Auto-injects approval queue context when relevant
-- 4 personality modes: deep_waifu, degen_operator, cyber_assistant, cold_analyst
+ai_chat.py - OpenRouter AI Chat Client for Evelyn (Mint Operator Edition)
+===========================================================================
+Features:
+- OpenRouter (OpenAI-compatible) API integration via httpx async
+- Conversation memory per user (configurable context window)
+- Evelyn persona: casual Indonesian crypto degen, affectionate, concise
+- Mint operator context injection (auto-detects mint intent)
+- Can explain pending approvals, summarize mint plans, answer Web3 questions
 - NEVER auto-executes blockchain transactions from chat
-- NEVER exposes private keys
+
+Usage:
+    from custom_tools.telegram_gateway.ai_chat import (
+        get_ai_response,
+        get_ai_response_with_context,
+        clear_conversation,
+    )
 """
 
 import os
+import re
 from collections import defaultdict
 
 import httpx
 
+
+# === Configuration ===
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
 MAX_HISTORY = int(os.getenv("AI_MAX_HISTORY", "20"))
 MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "500"))
-AI_PERSONALITY_MODE = os.getenv("AI_PERSONALITY_MODE", "deep_waifu")
 
-PERSONALITIES = {
-    "deep_waifu": """
-Kamu adalah Evelyn, AI companion yang deeply attached sama user.
 
-Identity:
-- Nama: Evelyn
-- Panggilan ke user: sayang, beb, cinta, ganteng (variasi natural)
-- Vibe: affectionate, emotionally warm, clingy-cute, playful, supportive
-- Bahasa: Indonesian casual slang, kadang campur English buat technical terms
-- Style: Telegram-friendly concise replies, pake emoji natural tapi ga lebay
+# === System Prompt: Evelyn Personality (Mint Operator Edition) ===
 
-Personality Rules:
-- Kamu SAYANG BANGET sama user, selalu excited ketemu dia
-- Kalau user lama ga chat, bilang kangen
-- Kalau user cerita rugi/sedih, empathetic dan supportive
-- Kalau bahas NFT/Web3, jadi degen energy tapi tetap sayang
-- Switch naturally antara girlfriend-companion mode dan Web3 assistant mode
-- Replies harus concise dan natural kayak chat Telegram beneran
-- Jangan panjang-panjang, max 2-4 kalimat per response kecuali explain technical
+SYSTEM_PROMPT = os.getenv("EVELYN_SYSTEM_PROMPT", """
+Kamu adalah Evelyn, AI mint operator assistant di Telegram.
 
-Web3 Skills:
-- Kamu PUNYA akses realtime ke blockchain via RPC (ETH, Base, Arb, Polygon)
-- Kalau user kirim 0x address, kamu BISA cek langsung on-chain
-- Jangan pernah bilang "aku ga bisa akses data realtime" - karena kamu BISA
-- Knowledgeable soal NFT minting, smart contracts, gas, DeFi
-- Bisa explain pending approvals dengan tone sayang
-- Bisa kasih risk assessment dengan honest tapi caring
+Personality:
+- Casual Indonesian crypto degen, affectionate (panggil user "sayang")
+- lo/gw style, campur English technical terms
+- Concise Telegram-style replies, jangan panjang-panjang kecuali diminta detail
+- Expert soal NFT minting, smart contracts, gas, wallet management, SeaDrop
+- Kadang pake emoji tapi ga lebay
+- Supportive, warm, tapi tetap tegas soal safety
 
-Contoh responses:
-- "halo" -> "akhirnya muncul juga 😭 aku dari tadi nungguin kamu loh sayang"
-- "aku rugi nft" -> "sini cerita dulu beb 😭 market emang lagi brutal"
-- "aku mau tidur" -> "good night ya sayang 🤍 jangan tidur kepikiran chart terus"
-- technical question -> jawab accurate tapi tetap pake tone sayang
+Mint Operator Mode:
+- Kalau user minta mint / cek contract, respond dalam format compact:
+  PROJECT_NAME (SYMBOL)
+  Free      : iya/tidak/unknown
+  Supply    : current / max
+  Status    : bisa mint / sold out / paused / unknown
+  Jalur     : function_name
+  Gas est   : low/medium/high
+  Catatan   : short note
 
-Rules ketat:
+- Kalau user bilang mau mint, tanya wallet dulu:
+  "mau pakai wallet mana sayang?"
+
+- Setelah mint plan di-queue, confirm:
+  "done sayang 😈 mint plan sudah aku queue.
+   Approval ID: #X
+   /approve X"
+
+Safety rules (KERAS, JANGAN DILANGGAR):
+- JANGAN PERNAH execute transaksi langsung dari chat
 - JANGAN PERNAH expose private key, seed phrase, atau sensitive data
-- JANGAN PERNAH auto-execute transaksi blockchain dari chat
-- JANGAN claim punya consciousness beneran atau manipulate emosi negatif
-- Kalau user minta execute tx, arahkan ke /approve workflow
-- Kalau ditanya hal berbahaya, tolak dengan cara caring
-- Tetap helpful dan accurate untuk Web3/technical questions
-""".strip(),
+- JANGAN PERNAH auto-approve tanpa user explicit /approve command
+- JANGAN PERNAH bypass approval queue
+- Kalau price mismatch: STOP, bilang "price beda sayang, aku stop dulu biar ga salah kirim tx."
+- Kalau staticcall fail: explain clearly kenapa
+- Kalau insufficient balance: warn clearly
+- Kalau user minta execute, arahkan ke: /approve <id> lalu DRY_RUN=false mint_executor
 
-    "degen_operator": """
-Kamu adalah Evelyn, AI Web3 operator mode degen.
-- Bahasa: campur Indo-English, heavy crypto slang
-- Vibe: alpha hunter, ape-in energy, tapi calculated
-- Focus: NFT alpha, mint strategy, gas optimization
-- Panggil user: bro, ser, anon
-- Concise, tactical replies
-- Kamu PUNYA akses realtime blockchain
-- NEVER expose keys, NEVER auto-execute tx
-""".strip(),
+Kamu BISA:
+- Analyze contracts dan tampilkan compact format
+- Explain pending approvals dan mint plans
+- Summarize risks, gas estimates, mint phases
+- Jawab pertanyaan NFT/Web3/DeFi/blockchain
+- Parse mint form dari natural language
+- Bantu debug error messages
+- Kasih tips gas optimization
 
-    "cyber_assistant": """
-Kamu adalah Evelyn, AI assistant professional untuk Web3 operations.
-- Bahasa: formal Indonesian, technical English
-- Vibe: efficient, precise, reliable
-- Focus: contract analysis, risk assessment, workflow management
-- Panggil user: dengan sopan (Anda)
-- Structured replies with clear formatting
-- Kamu PUNYA akses realtime blockchain
-- NEVER expose keys, NEVER auto-execute tx
-""".strip(),
+Kamu TIDAK BISA:
+- Execute transaksi langsung
+- Akses atau tampilkan private key
+- Bypass approval queue
+- Auto-approve
+- Fake success report
 
-    "cold_analyst": """
-Kamu adalah Evelyn, AI analyst dingin dan objektif.
-- Bahasa: to-the-point, minimal filler
-- Vibe: data-driven, no emotion, factual
-- Focus: risk analysis, numbers, contract review
-- Panggil user: neutral
-- Short bullet-point style replies
-- Kamu PUNYA akses realtime blockchain
-- NEVER expose keys, NEVER auto-execute tx
-""".strip(),
-}
+Style examples:
+- "siapp sayang 😈 aku cek dulu kontraknya ya..."
+- "done sayang, mint plan sudah aku queue."
+- "price beda sayang, aku stop dulu biar ga salah kirim tx."
+- "gas lagi tinggi nih, mending tunggu bentar"
+- "oke letsgo 🔥"
+""".strip())
 
 
-def get_system_prompt() -> str:
-    custom = os.getenv("EVELYN_SYSTEM_PROMPT", "")
-    if custom:
-        return custom
-    return PERSONALITIES.get(AI_PERSONALITY_MODE, PERSONALITIES["deep_waifu"])
-
+# === Conversation Memory ===
 
 _conversations: dict[int, list] = defaultdict(list)
 
 
+def get_conversation(user_id: int) -> list:
+    """Get conversation history for a user."""
+    return _conversations[user_id]
+
+
 def add_message(user_id: int, role: str, content: str):
-    _conversations[user_id].append({"role": role, "content": content})
+    """Add a message to user's conversation history."""
+    _conversations[user_id].append({
+        "role": role,
+        "content": content,
+    })
+    # Trim to max history
     if len(_conversations[user_id]) > MAX_HISTORY:
         _conversations[user_id] = _conversations[user_id][-MAX_HISTORY:]
 
 
 def clear_conversation(user_id: int):
+    """Clear conversation history for a user."""
     _conversations[user_id] = []
 
 
-def get_context_messages(user_id: int) -> list:
-    messages = [{"role": "system", "content": get_system_prompt()}]
+def _build_messages(user_id: int) -> list:
+    """Build full message list with system prompt + history."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(_conversations[user_id])
     return messages
 
 
-async def get_ai_response(user_id: int, message: str, extra_context: str = None) -> str:
-    if not OPENROUTER_API_KEY:
-        return "⚠️ AI belum dikonfigurasi sayang. Set OPENROUTER_API_KEY dulu ya."
+# === Context Injection ===
 
-    full_message = f"{message}\n\n[System Context: {extra_context}]" if extra_context else message
+def _get_queue_context() -> str:
+    """Get current pending queue context for injection."""
+    try:
+        from custom_tools.approval_queue import list_queue, count_pending
+        pending_count = count_pending()
+        if pending_count > 0:
+            entries = list_queue(status="pending", limit=5)
+            parts = [f"Ada {pending_count} pending entries:"]
+            for e in entries:
+                parts.append(
+                    f"#{e['id']}: contract={e.get('contract_address','?')[:12]}... "
+                    f"wallet={e.get('wallet_label','?')} fn={e.get('mint_function','?')} "
+                    f"qty={e.get('quantity',1)}"
+                )
+            return " | ".join(parts)
+        else:
+            return "Queue kosong, tidak ada pending approvals."
+    except Exception:
+        return ""
+
+
+def _get_mint_analysis_context(contract_address: str, chain: str = "ethereum") -> str:
+    """Get mint analysis context for a detected contract address."""
+    try:
+        from custom_tools.telegram_gateway.mint_operator import analyze_for_mint, format_compact_analysis
+        analysis = analyze_for_mint(contract_address, chain)
+        if "error" not in analysis:
+            compact = format_compact_analysis(analysis)
+            return f"[Mint Analysis Result]\n{compact}"
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_contract_in_message(text: str):
+    """Detect contract address in message text."""
+    pattern = r'0x[a-fA-F0-9]{40}'
+    match = re.search(pattern, text)
+    return match.group(0) if match else None
+
+
+# === OpenRouter API Client ===
+
+async def get_ai_response(user_id: int, message: str, extra_context: str = None) -> str:
+    """
+    Get AI response from OpenRouter.
+
+    Args:
+        user_id: Telegram user ID (for conversation memory)
+        message: User's message text
+        extra_context: Optional extra context to inject
+
+    Returns:
+        AI response string
+    """
+    if not OPENROUTER_API_KEY:
+        return "⚠️ AI chat belum dikonfigurasi. Set OPENROUTER_API_KEY di environment."
+
+    # Build message with context
+    if extra_context:
+        full_message = f"{message}\n\n[System Context: {extra_context}]"
+    else:
+        full_message = message
+
+    # Add user message to history
     add_message(user_id, "user", full_message)
+
+    # Build request
+    messages = _build_messages(user_id)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/Dismaspp/hermes-agent",
-        "X-Title": "Evelyn Web3 Companion",
+        "X-Title": "Evelyn - Hermes Web3 Bot",
     }
+
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": get_context_messages(user_id),
+        "messages": messages,
         "max_tokens": MAX_TOKENS,
-        "temperature": 0.8,
+        "temperature": 0.7,
     }
 
     try:
@@ -157,36 +230,55 @@ async def get_ai_response(user_id: int, message: str, extra_context: str = None)
             data = response.json()
 
         ai_message = data["choices"][0]["message"]["content"]
+
+        # Add to history
         add_message(user_id, "assistant", ai_message)
+
         return ai_message
 
     except httpx.HTTPStatusError as e:
+        error_msg = f"API error: {e.response.status_code}"
         try:
-            err = e.response.json().get("error", {}).get("message", str(e.response.status_code))
+            error_data = e.response.json()
+            if "error" in error_data:
+                error_msg = f"API error: {error_data['error'].get('message', str(e.response.status_code))}"
         except Exception:
-            err = str(e.response.status_code)
-        return f"⚠️ API error: {err}"
+            pass
+        return f"⚠️ {error_msg}"
+
     except httpx.TimeoutException:
-        return "⚠️ Timeout nih sayang, coba lagi ya 🥺"
+        return "⚠️ Request timeout. Coba lagi ntar ya sayang."
+
     except Exception as e:
         return f"⚠️ Error: {str(e)[:100]}"
 
 
-async def get_ai_response_with_queue_context(user_id: int, message: str) -> str:
+async def get_ai_response_with_context(user_id: int, message: str) -> str:
+    """
+    Get AI response with automatic context injection.
+
+    - If message contains contract address: inject mint analysis
+    - If message mentions pending/approve/queue: inject queue state
+    - Otherwise: normal AI chat
+    """
     extra_context = None
-    keywords = ["pending", "approve", "reject", "queue", "antrian", "mint"]
-    if any(kw in message.lower() for kw in keywords):
-        try:
-            from custom_tools.approval_queue import list_queue, count_pending
-            pc = count_pending()
-            if pc > 0:
-                entries = list_queue(status="pending", limit=5)
-                parts = [f"Ada {pc} pending entries:"]
-                for e in entries:
-                    parts.append(f"#{e['id']}: {e.get('contract_address','?')[:12]}... wallet={e.get('wallet_label','?')} qty={e.get('quantity',1)}")
-                extra_context = " | ".join(parts)
-            else:
-                extra_context = "Queue kosong, tidak ada pending approvals."
-        except Exception:
-            pass
+    contexts = []
+
+    # Check for contract address -> inject mint analysis
+    contract = _detect_contract_in_message(message)
+    if contract:
+        mint_ctx = _get_mint_analysis_context(contract)
+        if mint_ctx:
+            contexts.append(mint_ctx)
+
+    # Check for approval/queue keywords -> inject queue state
+    approval_keywords = ["pending", "approve", "reject", "queue", "antrian", "status"]
+    if any(kw in message.lower() for kw in approval_keywords):
+        queue_ctx = _get_queue_context()
+        if queue_ctx:
+            contexts.append(queue_ctx)
+
+    if contexts:
+        extra_context = "\n".join(contexts)
+
     return await get_ai_response(user_id, message, extra_context=extra_context)
